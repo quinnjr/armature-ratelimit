@@ -42,6 +42,7 @@ redis = ["dep:redis", "armature-redis"]
 full = ["redis"]
 
 [dev-dependencies]
+cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
 tokio-test = "0.4"
 # Docker-backed Redis for the Redis-store regression tests. Self-skips when
