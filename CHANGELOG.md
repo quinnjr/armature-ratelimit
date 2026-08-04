@@ -9,6 +9,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Added
+
+- Adopted the `ratelimit` criterion benchmark (token bucket, sliding window, concurrent and hot-key workloads) from the root package's `benches/`. Run it with `cargo bench -p armature-ratelimit --bench ratelimit`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry. `criterion` also gains the `async_tokio` feature: the limiter benchmarks use `Bencher::to_async`, which is feature-gated, so without it this bench does not compile outside the workspace.
+
 ### Fixed
 
 - **Breaking:** an unkeyed request is now governed by an explicit `UnkeyedRequestPolicy` and counted in `unkeyed_allow_count`. The default middleware could never extract a key, so it allowed every request with only a log line and no counter — an inert security control.

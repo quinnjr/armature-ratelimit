@@ -3,6 +3,7 @@ name = "armature-ratelimit"
 version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
+autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
 authors.workspace = true
 license.workspace = true
 repository = "https://github.com/quinnjr/armature-ratelimit"
@@ -42,6 +43,7 @@ redis = ["dep:redis", "armature-redis"]
 full = ["redis"]
 
 [dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
 tokio-test = "0.4"
@@ -50,3 +52,8 @@ tokio-test = "0.4"
 # never requires a container.
 armature-testkit = { path = "../armature-testkit", features = ["containers"] }
 
+# Explicit bench targets only: a stray file under benches/ should not silently
+# become a target.
+[[bench]]
+name = "ratelimit"
+harness = false
