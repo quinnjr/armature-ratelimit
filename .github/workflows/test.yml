@@ -1,0 +1,56 @@
+name: Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `armature-testkit` is `publish = false`, so this crate's dev-dependency on
+      # it cannot come from the registry. It is the one sibling that still has to
+      # be present on disk; everything else resolves from crates.io.
+      - uses: actions/checkout@v4
+        with:
+          repository: quinnjr/armature-testkit
+          path: armature-testkit
+      - name: Move the checkout beside this crate
+        run: |
+          mkdir -p ../armature-testkit
+          cp -r armature-testkit/. ../armature-testkit/
+          rm -rf armature-testkit
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  msrv:
+    name: MSRV 1.94.1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `armature-testkit` is `publish = false`, so this crate's dev-dependency on
+      # it cannot come from the registry. It is the one sibling that still has to
+      # be present on disk; everything else resolves from crates.io.
+      - uses: actions/checkout@v4
+        with:
+          repository: quinnjr/armature-testkit
+          path: armature-testkit
+      - name: Move the checkout beside this crate
+        run: |
+          mkdir -p ../armature-testkit
+          cp -r armature-testkit/. ../armature-testkit/
+          rm -rf armature-testkit
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # `--all-targets` without `--all-features`: the MSRV claim is about the
+      # crate as published with its defaults, not about every optional feature.
+      - run: cargo check --all-targets

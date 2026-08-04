@@ -1,0 +1,35 @@
+name: Lint
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `armature-testkit` is `publish = false`, so this crate's dev-dependency on
+      # it cannot come from the registry. It is the one sibling that still has to
+      # be present on disk; everything else resolves from crates.io.
+      - uses: actions/checkout@v4
+        with:
+          repository: quinnjr/armature-testkit
+          path: armature-testkit
+      - name: Move the checkout beside this crate
+        run: |
+          mkdir -p ../armature-testkit
+          cp -r armature-testkit/. ../armature-testkit/
+          rm -rf armature-testkit
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      # Matches the framework gate: the whole target graph, warnings denied.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
