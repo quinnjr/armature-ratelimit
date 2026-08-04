@@ -13,13 +13,17 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # `armature-testkit` is `publish = false`, so this crate's dev-dependency on
       # it cannot come from the registry. It is the one sibling that still has to
       # be present on disk; everything else resolves from crates.io.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: quinnjr/armature-testkit
+          # Pinned: without a ref this takes whatever the default branch holds
+          # at the moment the job starts, which made four repos fail when their
+          # workflows ran before testkit's own push had landed.
+          ref: develop
           path: armature-testkit
       - name: Move the checkout beside this crate
         run: |
