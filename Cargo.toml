@@ -1,6 +1,6 @@
 [package]
 name = "armature-ratelimit"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.94.1"
 autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
@@ -14,7 +14,7 @@ categories = ["web-programming", "network-programming"]
 
 [dependencies]
 # Armature core for Middleware trait
-armature-core = { version = "0.8" }
+armature-core = { version = "0.9" }
 armature-log = { version = "0.2" }
 
 # Core dependencies
