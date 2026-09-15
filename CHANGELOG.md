@@ -9,21 +9,12 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
-### Added
+## [0.5.0] - 2026-09-15
 
-- Adopted the `ratelimit` criterion benchmark (token bucket, sliding window, concurrent and hot-key workloads) from the root package's `benches/`. Run it with `cargo bench -p armature-ratelimit --bench ratelimit`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry. `criterion` also gains the `async_tokio` feature: the limiter benchmarks use `Bencher::to_async`, which is feature-gated, so without it this bench does not compile outside the workspace.
+### Changed
 
-### Fixed
-
-- **Breaking:** an unkeyed request is now governed by an explicit `UnkeyedRequestPolicy` and counted in `unkeyed_allow_count`. The default middleware could never extract a key, so it allowed every request with only a log line and no counter — an inert security control.
-- **Breaking:** `KeyExtractor::Custom` is removed. It carried a description string and no function, so selecting it silently disabled rate limiting through the unkeyed path; `KeyExtractorFn`/`KeyExtractorBuilder` are the working mechanism.
-- **Breaking:** `MemoryStore::new()` defaults to a bounded `max_keys` and a shorter idle TTL. The documented protection against a key-rotating client did not hold under the previous unbounded default.
-- Eviction at the cap is amortized over a batch instead of a full scan per new key, so the attacker the cap targets can no longer convert memory pressure into CPU pressure.
-- Rate-limit keys use `path_only()`, closing a bucket-minting bypass via query strings.
-
-### Changed — `0.2.1` → `0.2.2`
-
-- Migrated onto `armature-core` `0.8`'s `Bytes`-backed request and response types. No behavior change beyond what that migration implies; see [`armature-core/CHANGELOG.md`](../armature-core/CHANGELOG.md).
+- **Breaking:** requires `armature-core` 0.10 (was `0.9`); its types appear in this crate's API, so the requirement change is breaking here and the minor moves. Part of the `armature-core` 0.10 release train.
+- Dependencies bumped to their latest releases: `http` 1.4 → 1.5, `redis` 1.3 → 1.7, `tokio` 1.52 → 1.53, `tokio` 1.52 → 1.53.
 
 ## [0.4.0] - 2026-08-05
 
