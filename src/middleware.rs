@@ -90,10 +90,13 @@ pub enum UnkeyedRequestPolicy {
 /// as the code previously did, let an attacker rotate that hop per request to
 /// mint a fresh bucket each time (limit bypass) or spoof a victim's IP (pollution).
 ///
-/// Note: `armature_core::HttpRequest` does not currently expose the socket peer
-/// address, so when XFF trust is not configured there is no non-spoofable peer to
-/// fall back to; IP-based limiting is simply not applied to such requests. Enable
-/// it explicitly by setting the trusted-proxy depth.
+/// Note: `armature_core::HttpRequest::peer` now carries the socket peer address,
+/// and `HttpRequest::client_address` implements this same depth-from-the-right
+/// rule with a `depth == 0` case that falls back to that peer. This function
+/// predates it and is kept because it works on a bare header value rather than a
+/// request; the two must not disagree. When this middleware is next touched, the
+/// worthwhile change is to call `client_address` so that a `depth` of `0` limits
+/// on the real socket instead of not limiting by IP at all.
 fn forwarded_ip_at_depth(xff: &str, depth: usize) -> Option<IpAddr> {
     if depth == 0 {
         return None;
