@@ -4,6 +4,7 @@
 //! from incoming requests.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 /// Type alias for key extractor function
 pub type KeyExtractorFn = Box<dyn Fn(&RequestInfo) -> Option<String> + Send + Sync>;
@@ -75,6 +76,120 @@ impl RequestInfo {
     }
 }
 
+/// Full lowercase-hex SHA-256 digest of a rate-limit key.
+///
+/// Used wherever a key leaves process memory or could be read by someone other
+/// than the request's author: API-key bucket names, Redis key names. A bucket
+/// keyed on the raw value would put a live credential into the store's key
+/// space (and into any `KEYS`/`SCAN` output, slowlog, or replica), so only the
+/// digest is ever stored.
+pub fn key_digest(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    let mut out = String::with_capacity(64);
+    for byte in digest.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Short, non-reversible fingerprint of a rate-limit key for log fields.
+///
+/// The first 12 hex characters of [`key_digest`]: enough to correlate log lines
+/// for the same caller, useless for recovering an API key, token or user id.
+/// Rate-limit keys must never be logged verbatim.
+pub fn key_fingerprint(key: &str) -> String {
+    let mut digest = key_digest(key);
+    digest.truncate(12);
+    digest
+}
+
+/// The bucket an API key is counted in: `apikey:` + [`key_digest`] of the key.
+pub fn api_key_bucket(api_key: &str) -> String {
+    format!("apikey:{}", key_digest(api_key))
+}
+
+/// The bucket identity of a client address.
+///
+/// IPv4 addresses are used as-is. IPv6 addresses are truncated to their /64
+/// prefix: a single subscriber is routinely delegated a whole /64 (or more), so
+/// keying per /128 hands every client 2^64 fresh buckets for free. IPv4-mapped
+/// IPv6 addresses (`::ffff:a.b.c.d`) are keyed as the IPv4 address they carry,
+/// so a dual-stack listener does not split one client across two buckets.
+pub fn ip_bucket(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.to_string();
+            }
+            let prefix = u128::from(v6) & (!0u128 << 64);
+            format!("{}/64", std::net::Ipv6Addr::from(prefix))
+        }
+    }
+}
+
+/// Normalize a request path for per-endpoint bucketing.
+///
+/// The query string and fragment are dropped, empty segments (`//`) and `.`
+/// segments are removed, `..` pops the previous segment (never above the root),
+/// and a trailing slash is not significant. Without this, `//login`,
+/// `/./login`, `/x/../login` and `/login/` would each mint a fresh bucket for
+/// the same endpoint under [`KeyExtractor::IpAndPath`] /
+/// [`KeyExtractor::UserIdAndPath`].
+pub fn normalize_path(path: &str) -> String {
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+    let mut out = String::with_capacity(path.len() + 1);
+    out.push('/');
+    out.push_str(&segments.join("/"));
+    out
+}
+
+/// Decides whether a presented API key is genuine.
+///
+/// [`KeyExtractor::ApiKey`] only keys a request on an API key this validator
+/// accepts. Keying on whatever value a caller sends lets every request carry a
+/// fresh random "key", mint a fresh bucket, and never be limited (while growing
+/// the store without bound). A key that fails validation yields no rate-limit
+/// key, so the request falls to the middleware's
+/// [`crate::UnkeyedRequestPolicy`] (deny by default).
+///
+/// The check runs on every request, so it should be an in-memory lookup (e.g.
+/// a set of key digests). When keys are verified asynchronously against a
+/// database, do that in an authentication layer that attaches an
+/// `armature_core::VerifiedIdentity`, and rate limit with [`KeyExtractor::UserId`].
+#[derive(Clone)]
+pub struct ApiKeyValidator(Arc<dyn Fn(&str) -> bool + Send + Sync>);
+
+impl ApiKeyValidator {
+    /// Wrap a validation function.
+    pub fn new(f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Whether `key` is a valid API key.
+    pub fn is_valid(&self, key: &str) -> bool {
+        (self.0)(key)
+    }
+}
+
+impl std::fmt::Debug for ApiKeyValidator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKeyValidator(..)")
+    }
+}
+
 /// Key extraction strategies
 ///
 /// Every variant here is a strategy this enum can actually evaluate. Custom
@@ -84,24 +199,41 @@ impl RequestInfo {
 /// disables rate limiting for the request.
 #[derive(Debug, Clone, Default)]
 pub enum KeyExtractor {
-    /// Extract key from IP address
+    /// Key on the client address (IPv6 bucketed by /64, see [`ip_bucket`]).
+    ///
+    /// [`crate::RateLimitMiddleware`] fills the address from
+    /// `HttpRequest::client_address(trusted_proxy_depth)`: the socket peer by
+    /// default, or the forwarded client when a proxy depth is configured.
     #[default]
     Ip,
-    /// Extract key from user ID (requires authentication)
+    /// Key on the authenticated user ID.
+    ///
+    /// [`crate::RateLimitMiddleware`] fills it **only** from the
+    /// `armature_core::VerifiedIdentity` request extension an authentication
+    /// layer (e.g. `armature_auth::JwtAuthMiddleware`) attaches after verifying
+    /// a credential, never from a request header, so the rate-limit middleware
+    /// must run after authentication.
     UserId,
-    /// Extract key from API key header
+    /// Key on an API key header value that `validator` accepts, stored as its
+    /// SHA-256 digest (see [`api_key_bucket`]).
     ApiKey {
         /// Header name for API key
         header_name: String,
+        /// Accepts only genuine API keys; see [`ApiKeyValidator`].
+        validator: ApiKeyValidator,
     },
     /// Extract key from a custom header
+    ///
+    /// The header is client-controlled: use it only for values that an earlier
+    /// layer has verified or overwritten (e.g. a tenant header set by your own
+    /// gateway), never as the sole abuse control on a public endpoint.
     Header {
         /// Header name to extract
         name: String,
     },
-    /// Combine IP and path for per-endpoint limiting
+    /// Combine client address and normalized path for per-endpoint limiting
     IpAndPath,
-    /// Combine user ID and path for per-endpoint limiting
+    /// Combine user ID and normalized path for per-endpoint limiting
     UserIdAndPath,
 }
 
@@ -116,10 +248,21 @@ impl KeyExtractor {
         Self::UserId
     }
 
-    /// Create an API key-based extractor
-    pub fn api_key(header_name: impl Into<String>) -> Self {
+    /// Create an API key-based extractor that keys only on keys `validator`
+    /// accepts.
+    ///
+    /// ```
+    /// use armature_ratelimit::KeyExtractor;
+    ///
+    /// let extractor = KeyExtractor::api_key("X-API-Key", |key: &str| key == "sk_live_known");
+    /// ```
+    pub fn api_key(
+        header_name: impl Into<String>,
+        validator: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Self {
         Self::ApiKey {
             header_name: header_name.into(),
+            validator: ApiKeyValidator::new(validator),
         }
     }
 
@@ -141,15 +284,23 @@ impl KeyExtractor {
     /// Extract the key from request info
     pub fn extract(&self, info: &RequestInfo) -> Option<String> {
         match self {
-            Self::Ip => info.ip.map(|ip| ip.to_string()),
+            Self::Ip => info.ip.map(ip_bucket),
             Self::UserId => info.user_id.clone(),
-            Self::ApiKey { header_name } => info.get_header(header_name).map(|s| s.to_string()),
+            Self::ApiKey {
+                header_name,
+                validator,
+            } => info
+                .get_header(header_name)
+                .filter(|key| !key.is_empty() && validator.is_valid(key))
+                .map(api_key_bucket),
             Self::Header { name } => info.get_header(name).map(|s| s.to_string()),
-            Self::IpAndPath => info.ip.map(|ip| format!("{}:{}", ip, info.path)),
+            Self::IpAndPath => info
+                .ip
+                .map(|ip| format!("{}:{}", ip_bucket(ip), normalize_path(&info.path))),
             Self::UserIdAndPath => info
                 .user_id
                 .as_ref()
-                .map(|uid| format!("{}:{}", uid, info.path)),
+                .map(|uid| format!("{}:{}", uid, normalize_path(&info.path))),
         }
     }
 
@@ -159,7 +310,7 @@ impl KeyExtractor {
     /// of copying the whole header map into [`RequestInfo`] on every request.
     pub fn required_header(&self) -> Option<&str> {
         match self {
-            Self::ApiKey { header_name } => Some(header_name),
+            Self::ApiKey { header_name, .. } => Some(header_name),
             Self::Header { name } => Some(name),
             _ => None,
         }
@@ -204,11 +355,13 @@ impl KeyExtractorBuilder {
         self.with_extractor(KeyExtractor::UserId)
     }
 
-    /// Try API key first
-    pub fn prefer_api_key(self, header_name: impl Into<String>) -> Self {
-        self.with_extractor(KeyExtractor::ApiKey {
-            header_name: header_name.into(),
-        })
+    /// Try a validated API key first (see [`KeyExtractor::api_key`])
+    pub fn prefer_api_key(
+        self,
+        header_name: impl Into<String>,
+        validator: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.with_extractor(KeyExtractor::api_key(header_name, validator))
     }
 
     /// Disable fallback to IP if other extractors fail
@@ -232,7 +385,7 @@ impl KeyExtractorBuilder {
 
             // Fallback to IP if enabled
             if fallback_to_ip && let Some(ip) = info.ip {
-                return Some(ip.to_string());
+                return Some(ip_bucket(ip));
             }
 
             None
@@ -280,11 +433,90 @@ mod tests {
 
     #[test]
     fn test_api_key_extractor() {
-        let extractor = KeyExtractor::api_key("X-API-Key");
+        let extractor = KeyExtractor::api_key("X-API-Key", |k: &str| k == "sk_test_abc123");
         let request = sample_request();
 
         let key = extractor.extract(&request).unwrap();
-        assert_eq!(key, "sk_test_abc123");
+        assert_eq!(key, api_key_bucket("sk_test_abc123"));
+        assert!(
+            !key.contains("sk_test_abc123"),
+            "the raw API key must never be the bucket name"
+        );
+    }
+
+    /// Security regression (H11): an unvalidated API key used to mint a fresh
+    /// bucket per random value, so a caller rotating junk keys was never
+    /// limited. Only keys the validator accepts produce a key at all.
+    #[test]
+    fn test_api_key_extractor_rejects_unvalidated_keys() {
+        let extractor = KeyExtractor::api_key("X-API-Key", |k: &str| k == "sk_live_known");
+        for junk in ["random-1", "random-2", ""] {
+            let request = RequestInfo::new("/api", "GET").with_header("X-API-Key", junk);
+            assert_eq!(extractor.extract(&request), None, "junk key {junk:?} keyed");
+        }
+        let request = RequestInfo::new("/api", "GET").with_header("X-API-Key", "sk_live_known");
+        assert_eq!(
+            extractor.extract(&request),
+            Some(api_key_bucket("sk_live_known"))
+        );
+    }
+
+    #[test]
+    fn test_key_digest_and_fingerprint() {
+        let digest = key_digest("abc");
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(key_fingerprint("abc"), "ba7816bf8f01");
+    }
+
+    /// Security regression (H11): IPv6 was keyed per /128, so one subscriber
+    /// with a delegated /64 had 2^64 buckets.
+    #[test]
+    fn test_ipv6_bucketed_by_64() {
+        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(ip_bucket(a), ip_bucket(b));
+        assert_eq!(ip_bucket(a), "2001:db8:1:2::/64");
+        assert_ne!(ip_bucket(a), ip_bucket(c));
+
+        let mapped: IpAddr = "::ffff:192.0.2.7".parse().unwrap();
+        assert_eq!(ip_bucket(mapped), "192.0.2.7");
+
+        let extractor = KeyExtractor::ip();
+        assert_eq!(
+            extractor.extract(&RequestInfo::new("/", "GET").with_ip(a)),
+            extractor.extract(&RequestInfo::new("/", "GET").with_ip(b)),
+        );
+    }
+
+    /// Security regression (H11): `IpAndPath` keyed on the raw path, so
+    /// `//login`, `/./login` and `/x/../login` each got a fresh bucket.
+    #[test]
+    fn test_path_normalization_shares_bucket() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let extractor = KeyExtractor::ip_and_path();
+        let expected = "192.0.2.1:/login".to_string();
+        for path in [
+            "/login",
+            "//login",
+            "/./login",
+            "/x/../login",
+            "/login/",
+            "/login?a=1",
+            "/../../login",
+        ] {
+            let info = RequestInfo::new(path, "POST").with_ip(ip);
+            assert_eq!(extractor.extract(&info), Some(expected.clone()), "{path}");
+        }
+        assert_eq!(normalize_path(""), "/");
+        assert_eq!(normalize_path("/a//b/./c/../d"), "/a/b/d");
+
+        let by_user = KeyExtractor::user_id_and_path();
+        let info = RequestInfo::new("//api//users/", "GET").with_user_id("u1");
+        assert_eq!(by_user.extract(&info), Some("u1:/api/users".to_string()));
     }
 
     #[test]
@@ -318,7 +550,7 @@ mod tests {
     fn test_builder() {
         let extractor = KeyExtractorBuilder::new()
             .prefer_user_id()
-            .prefer_api_key("X-API-Key")
+            .prefer_api_key("X-API-Key", |k: &str| k == "sk_test_abc123")
             .build();
 
         let request = sample_request();
@@ -331,7 +563,7 @@ mod tests {
             .with_header("X-API-Key", "sk_test_abc123");
 
         let key = extractor(&request_no_user).unwrap();
-        assert_eq!(key, "sk_test_abc123");
+        assert_eq!(key, api_key_bucket("sk_test_abc123"));
 
         // Without user ID or API key, falls back to IP
         let request_ip_only = RequestInfo::new("/api/users", "GET")

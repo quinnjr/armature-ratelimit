@@ -180,3 +180,36 @@ async fn redis_operation_timeout_is_enforced() {
         "expected RateLimitError::Timeout, got: {err:?}"
     );
 }
+
+/// Security regression (H11/L14): Redis key names used to embed the raw
+/// rate-limit key (an API key, user id or header value). Only its SHA-256
+/// digest may appear in the key space.
+#[tokio::test]
+async fn redis_key_names_use_digest_not_raw_key() {
+    armature_testkit::skip_if_no_docker!();
+    let redis = RedisContainer::start().await;
+    let url = redis.url();
+    let store = RedisStore::new(&url).await.unwrap();
+
+    let secret = "sk_live_super_secret";
+    store.token_bucket_check(secret, 5, 1.0).await.unwrap();
+    store
+        .fixed_window_check(secret, 5, Duration::from_secs(60))
+        .await
+        .unwrap();
+    store
+        .sliding_window_check(secret, 5, Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    let all = keys(&url, "*").await;
+    assert!(!all.is_empty());
+    let digest = armature_ratelimit::extractor::key_digest(secret);
+    for key in &all {
+        assert!(!key.contains(secret), "raw key leaked into Redis: {key}");
+        assert!(key.contains(&digest), "key not digest-named: {key}");
+    }
+    assert_eq!(store.remaining(secret).await.unwrap(), 4);
+    store.reset(secret).await.unwrap();
+    assert!(keys(&url, "*").await.is_empty());
+}

@@ -93,7 +93,7 @@ pub mod stores;
 pub use algorithms::{Algorithm, RateLimitAlgorithm};
 pub use config::{RateLimitConfig, RateLimiterBuilder};
 pub use error::{RateLimitError, RateLimitResult};
-pub use extractor::{KeyExtractor, KeyExtractorFn};
+pub use extractor::{ApiKeyValidator, KeyExtractor, KeyExtractorFn};
 pub use middleware::{RateLimitMiddleware, UnkeyedRequestPolicy};
 pub use stores::{MemoryStore, RateLimitStore, StoreType};
 
@@ -261,7 +261,7 @@ impl RateLimiter {
 
     /// Check if a request with the given key is allowed
     pub async fn check(&self, key: &str) -> RateLimitResult<RateLimitCheckResult> {
-        trace!(key = %key, "Checking rate limit");
+        trace!(key = %crate::extractor::key_fingerprint(key), "Checking rate limit");
 
         match &self.algorithm {
             Algorithm::TokenBucket {
@@ -309,7 +309,7 @@ impl RateLimiter {
         };
 
         if result.0 {
-            debug!(key = %key, remaining = result.1, "Token bucket: request allowed");
+            debug!(key = %crate::extractor::key_fingerprint(key), remaining = result.1, "Token bucket: request allowed");
             Ok(RateLimitCheckResult::allowed(result.1, capacity, reset_at))
         } else {
             let retry_after = if refill_rate > 0.0 && refill_rate.is_finite() {
@@ -320,7 +320,7 @@ impl RateLimiter {
                 // postponed" the same way it treats an open-ended reset_at.
                 Duration::from_secs(u64::MAX)
             };
-            warn!(key = %key, retry_after = ?retry_after, "Token bucket: request denied");
+            warn!(key = %crate::extractor::key_fingerprint(key), retry_after = ?retry_after, "Token bucket: request denied");
             Ok(RateLimitCheckResult::denied(
                 capacity,
                 reset_at,
@@ -348,7 +348,7 @@ impl RateLimiter {
             + window.as_secs();
 
         if result.0 {
-            debug!(key = %key, remaining = result.1, "Sliding window: request allowed");
+            debug!(key = %crate::extractor::key_fingerprint(key), remaining = result.1, "Sliding window: request allowed");
             Ok(RateLimitCheckResult::allowed(
                 result.1,
                 max_requests,
@@ -359,7 +359,7 @@ impl RateLimiter {
             // oldest logged request falls out of the sliding window), not a
             // hardcoded 1s.
             let retry_after = window;
-            warn!(key = %key, retry_after = ?retry_after, "Sliding window: request denied");
+            warn!(key = %crate::extractor::key_fingerprint(key), retry_after = ?retry_after, "Sliding window: request denied");
             Ok(RateLimitCheckResult::denied(
                 max_requests,
                 reset_at,
@@ -393,7 +393,7 @@ impl RateLimiter {
         let reset_at = (reset_at_ms / 1000) as u64;
 
         if result.0 {
-            debug!(key = %key, remaining = result.1, "Fixed window: request allowed");
+            debug!(key = %crate::extractor::key_fingerprint(key), remaining = result.1, "Fixed window: request allowed");
             Ok(RateLimitCheckResult::allowed(
                 result.1,
                 max_requests,
@@ -403,7 +403,7 @@ impl RateLimiter {
             // Time until the current window rolls over. Millisecond-precise so
             // sub-second windows report a real (non-zero, non-panicking) delay.
             let retry_after = Duration::from_millis((reset_at_ms - now_ms) as u64);
-            warn!(key = %key, retry_after = ?retry_after, "Fixed window: request denied");
+            warn!(key = %crate::extractor::key_fingerprint(key), retry_after = ?retry_after, "Fixed window: request denied");
             Ok(RateLimitCheckResult::denied(
                 max_requests,
                 reset_at,
@@ -424,7 +424,7 @@ impl RateLimiter {
 
     /// Reset the rate limit for a key
     pub async fn reset(&self, key: &str) -> RateLimitResult<()> {
-        debug!(key = %key, "Resetting rate limit");
+        debug!(key = %crate::extractor::key_fingerprint(key), "Resetting rate limit");
         self.store.reset(key).await
     }
 }

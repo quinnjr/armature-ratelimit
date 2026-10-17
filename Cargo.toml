@@ -25,6 +25,9 @@ serde_json = "1.0"
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"
 tracing = "0.1"
+# API-key buckets, store key names and log fields carry a SHA-256 digest of the
+# rate-limit key, never the raw (possibly secret) value.
+sha2 = "0.11"
 
 # In-memory store
 dashmap = "6.2"
