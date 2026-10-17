@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
 ### Security
 
 - `RateLimitMiddleware` derives the client address from `HttpRequest::client_address(trusted_proxy_depth)`. With the default depth `0` it now keys on the **socket peer** (previously it had no address and limited nothing); with a depth it reads the forwarded chain across every `X-Forwarded-For` line instead of only the first. `X-Real-IP` is no longer consulted.
