@@ -1,6 +1,6 @@
 [package]
 name = "armature-ratelimit"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.94.1"
 autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
@@ -14,8 +14,8 @@ categories = ["web-programming", "network-programming"]
 
 [dependencies]
 # Armature core for Middleware trait
-armature-core = { version = "0.10" }
-armature-log = { version = "0.2" }
+armature-core = { version = "0.11" }
+armature-log = { version = "0.3" }
 
 # Core dependencies
 async-trait = "0.1"
@@ -25,6 +25,9 @@ serde_json = "1.0"
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"
 tracing = "0.1"
+# API-key buckets, store key names and log fields carry a SHA-256 digest of the
+# rate-limit key, never the raw (possibly secret) value.
+sha2 = "0.11"
 
 # In-memory store
 dashmap = "6.2"
@@ -34,7 +37,7 @@ http = "1.5"
 bytes = "1.12"
 
 # Redis support (optional) - uses armature-redis for DI integration
-armature-redis = { version = "0.2", optional = true }
+armature-redis = { version = "0.3", optional = true }
 redis = { version = "1.7", features = ["tokio-comp", "connection-manager"], optional = true }
 
 [features]

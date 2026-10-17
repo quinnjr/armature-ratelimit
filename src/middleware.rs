@@ -5,7 +5,8 @@
 
 use crate::RateLimiter;
 use crate::error::RateLimitHeaders;
-use crate::extractor::{KeyExtractor, RequestInfo};
+use crate::extractor::{KeyExtractor, RequestInfo, api_key_bucket, key_fingerprint};
+use armature_core::VerifiedIdentity;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,9 +27,9 @@ pub struct RateLimitMiddleware {
     /// When the store errors: `true` fails open (allow the request), `false`
     /// fails closed (deny). Mirrors `RateLimitConfig::skip_on_error`.
     skip_on_error: bool,
-    /// Number of trusted reverse proxies in front of the app. Controls how the
-    /// client IP is read from `X-Forwarded-For`; `0` (default) trusts no proxy
-    /// and ignores the header. Mirrors `RateLimitConfig::trusted_proxy_depth`.
+    /// Number of trusted reverse proxies in front of the app, passed to
+    /// `HttpRequest::client_address`; `0` (default) keys on the socket peer and
+    /// ignores forwarding headers. Mirrors `RateLimitConfig::trusted_proxy_depth`.
     trusted_proxy_depth: usize,
     /// Count of store errors that were let through because `skip_on_error` is
     /// `true`, observed by this middleware instance. Incremented every time
@@ -51,64 +52,28 @@ pub struct RateLimitMiddleware {
 
 /// What the middleware does with a request the key extractor cannot key.
 ///
-/// The unkeyed case is not exotic: the default [`KeyExtractor::Ip`] needs a
-/// client IP, and `armature_core::HttpRequest` exposes no socket peer address,
-/// so with the default `trusted_proxy_depth` of `0` (no forwarding header
-/// trusted) *every* request is unkeyed. A default-constructed middleware
-/// therefore rate limits nothing — which is defensible as a posture but must be
-/// a choice the deployment makes, and must be visible when it happens rather
-/// than being a silent bypass hidden behind a `warn!`.
+/// A request is unkeyed when the extractor has nothing to work with: no socket
+/// peer address (a hand-built request, or a transport without one), no
+/// verified `VerifiedIdentity` under [`KeyExtractor::UserId`], or no *validated* API
+/// key under [`KeyExtractor::ApiKey`]. Letting such requests through would make
+/// the abuse control trivially bypassable — omit the credential and you are
+/// never counted — so the default is [`UnkeyedRequestPolicy::Deny`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnkeyedRequestPolicy {
     /// Let the request through unchecked, counting it in
     /// [`RateLimitMiddleware::unkeyed_allow_count`].
     ///
-    /// The default, because the alternative would turn a middleware that was
-    /// merely ineffective into one that rejects all traffic.
-    #[default]
+    /// Opt in only where an unkeyed request is legitimately expected and
+    /// another layer protects the route (e.g. a `UserId`-keyed limiter on a
+    /// surface that also serves anonymous traffic, stacked behind an
+    /// IP-keyed one). Never use it on authentication endpoints (login,
+    /// password reset, OTP), where it turns the limiter off for any caller
+    /// that withholds the key.
     Allow,
     /// Reject the request with the same 429 response an exceeded limit
-    /// produces. Choose this when the key is expected to always be present
-    /// (e.g. an authenticated-only surface keyed on user ID) and its absence
-    /// means a misconfiguration rather than an anonymous caller.
+    /// produces. The default: a missing key fails closed.
+    #[default]
     Deny,
-}
-
-/// Select the client IP from an `X-Forwarded-For` value using the number of
-/// trusted proxies (`depth`).
-///
-/// `X-Forwarded-For` is a comma-separated list `client, proxy1, proxy2, ...`
-/// where each proxy *appends* the address it received the connection from, so
-/// the **rightmost** hops are the ones added by your own infrastructure and are
-/// the only trustworthy entries. The client is therefore selected
-/// `depth`-from-the-right (1-indexed): with a single trusted proxy (`depth == 1`)
-/// the rightmost hop is the client address your proxy observed.
-///
-/// A `depth` of `0` means **no proxy is trusted** — every entry is
-/// attacker-controlled, so this returns `None` and the caller does not derive an
-/// IP from the header at all. Trusting the first (leftmost) hop unconditionally,
-/// as the code previously did, let an attacker rotate that hop per request to
-/// mint a fresh bucket each time (limit bypass) or spoof a victim's IP (pollution).
-///
-/// Note: `armature_core::HttpRequest::peer` now carries the socket peer address,
-/// and `HttpRequest::client_address` implements this same depth-from-the-right
-/// rule with a `depth == 0` case that falls back to that peer. This function
-/// predates it and is kept because it works on a bare header value rather than a
-/// request; the two must not disagree. When this middleware is next touched, the
-/// worthwhile change is to call `client_address` so that a `depth` of `0` limits
-/// on the real socket instead of not limiting by IP at all.
-fn forwarded_ip_at_depth(xff: &str, depth: usize) -> Option<IpAddr> {
-    if depth == 0 {
-        return None;
-    }
-    let hops: Vec<&str> = xff
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    // `depth` counts from the right; out-of-range depth trusts nothing.
-    let idx = hops.len().checked_sub(depth)?;
-    hops.get(idx)?.parse().ok()
 }
 
 impl RateLimitMiddleware {
@@ -133,8 +98,8 @@ impl RateLimitMiddleware {
 
     /// Choose what happens to requests no rate limit key can be derived from.
     ///
-    /// Defaults to [`UnkeyedRequestPolicy::Allow`]. See that type for why the
-    /// unkeyed case is the common one under the default configuration.
+    /// Defaults to [`UnkeyedRequestPolicy::Deny`]. See that type for when
+    /// [`UnkeyedRequestPolicy::Allow`] is acceptable.
     pub fn with_unkeyed_policy(mut self, policy: UnkeyedRequestPolicy) -> Self {
         self.unkeyed_policy = policy;
         self
@@ -142,8 +107,8 @@ impl RateLimitMiddleware {
 
     /// Set the number of trusted reverse proxies in front of the app.
     ///
-    /// Controls how the client IP is derived from `X-Forwarded-For`. Defaults to
-    /// `0` (no proxy trusted; the header is ignored). See
+    /// Passed to `HttpRequest::client_address`. Defaults to `0`: the socket
+    /// peer is the client and `X-Forwarded-For` is ignored. See
     /// [`crate::config::RateLimitConfig::trusted_proxy_depth`].
     pub fn with_trusted_proxy_depth(mut self, depth: usize) -> Self {
         self.trusted_proxy_depth = depth;
@@ -211,11 +176,19 @@ impl RateLimitMiddleware {
             }
         };
 
-        trace!(key = %key, "Checking rate limit");
+        // Rate-limit keys can be credentials (API-key digests, user ids, custom
+        // header values): only a short digest prefix is ever logged.
+        let key_fp = key_fingerprint(&key);
+        trace!(key = %key_fp, "Checking rate limit");
 
-        // Check bypass
-        if self.bypass_keys.contains(&key) {
-            debug!(key = %key, "Key is in bypass list, allowing request");
+        // Check bypass. A bypass entry configured as a raw API key matches the
+        // digest bucket `KeyExtractor::ApiKey` produces for it.
+        if self
+            .bypass_keys
+            .iter()
+            .any(|b| *b == key || api_key_bucket(b) == key)
+        {
+            debug!(key = %key_fp, "Key is in bypass list, allowing request");
             return RateLimitCheckResponse::Allowed { headers: None };
         }
 
@@ -233,10 +206,10 @@ impl RateLimitMiddleware {
                 };
 
                 if result.allowed {
-                    trace!(key = %key, remaining = result.remaining, "Request allowed");
+                    trace!(key = %key_fp, remaining = result.remaining, "Request allowed");
                     RateLimitCheckResponse::Allowed { headers }
                 } else {
-                    info!(key = %key, retry_after = ?result.retry_after, "Rate limit exceeded");
+                    info!(key = %key_fp, retry_after = ?result.retry_after, "Rate limit exceeded");
                     RateLimitCheckResponse::Limited {
                         headers: if self.include_headers {
                             Some(RateLimitHeaders::denied(
@@ -422,53 +395,33 @@ impl armature_core::Middleware for RateLimitMiddleware {
                 > + Send,
         >,
     ) -> Result<armature_core::HttpResponse, armature_core::Error> {
-        // Derive the client IP from forwarding headers only when a trusted-proxy
-        // depth is configured. `X-Forwarded-For`/`X-Real-IP` are attacker-
-        // controlled unless the request is known to have transited a trusted
-        // proxy, so with the default depth of 0 they are ignored entirely (an
-        // attacker cannot rotate/spoof them to bypass or pollute rate limits).
-        let ip = if self.trusted_proxy_depth == 0 {
-            None
-        } else {
-            req.headers
-                .get("x-forwarded-for")
-                .and_then(|s| forwarded_ip_at_depth(s, self.trusted_proxy_depth))
-                .or_else(|| {
-                    req.headers
-                        .get("x-real-ip")
-                        .and_then(|s| s.trim().parse().ok())
-                })
-        };
+        // The client address comes from `client_address`, the one place that
+        // decides between the socket peer and the forwarded chain: depth 0 is
+        // the socket peer (forwarding headers ignored), depth N reads the Nth
+        // hop from the right across every `X-Forwarded-For` line. `X-Real-IP`
+        // is never consulted — it is a client-settable header like any other.
+        let ip = req.client_address(self.trusted_proxy_depth);
 
         // Build the key-extraction input from the few fields that are actually
-        // read. Copying the entire header map into owned `String`s per request
-        // was pure allocation for data no extractor looks at — the default one
-        // reads nothing but the IP.
-        //
-        // The routing path (query string excluded) is what identifies the
-        // endpoint: keying on the raw target would let a caller append a
-        // throwaway query parameter to mint a fresh bucket under `IpAndPath`.
+        // read. The routing path (query string excluded) identifies the
+        // endpoint; the path extractors normalize it further.
         let mut info = RequestInfo::new(req.path_only(), req.method_str());
 
         if let Some(ip) = ip {
             info = info.with_ip(ip);
         }
 
-        if let Some(uid) = req.headers.get("x-user-id") {
-            info = info.with_user_id(uid);
+        // Only a principal an authentication layer has verified. A header such
+        // as `X-User-Id` is set by the caller, who could otherwise pick a fresh
+        // bucket per request or exhaust a victim's.
+        if let Some(identity) = req.extension::<VerifiedIdentity>() {
+            info = info.with_user_id(identity.subject.clone());
         }
 
         if let Some(name) = self.key_extractor.required_header()
             && let Some(value) = req.headers.get(name)
         {
             info = info.with_header(name, value);
-        }
-
-        for name in ["x-api-key", "authorization"] {
-            if let Some(value) = req.headers.get(name) {
-                info = info.with_api_key(value);
-                break;
-            }
         }
 
         // Check rate limit
@@ -608,9 +561,9 @@ mod tests {
                 .await
                 .unwrap(),
         ))
-        .with_extractor(KeyExtractor::ApiKey {
-            header_name: "X-API-Key".to_string(),
-        })
+        .with_extractor(KeyExtractor::api_key("X-API-Key", |k: &str| {
+            k == "admin_key"
+        }))
         .with_bypass_keys(["admin_key"]);
 
         let bypass_info =
@@ -664,30 +617,6 @@ mod tests {
         assert_eq!(info.method, "POST");
         assert_eq!(info.user_id, Some("user_123".to_string()));
         assert_eq!(info.api_key, Some("test_key".to_string()));
-    }
-
-    #[test]
-    fn test_forwarded_ip_at_depth_selects_from_right() {
-        let xff = "203.0.113.5, 70.41.3.18, 150.172.238.178";
-        // depth 0: no proxy trusted, header ignored entirely.
-        assert_eq!(forwarded_ip_at_depth(xff, 0), None);
-        // depth 1: rightmost hop (added by our proxy).
-        assert_eq!(
-            forwarded_ip_at_depth(xff, 1),
-            Some(IpAddr::V4(Ipv4Addr::new(150, 172, 238, 178)))
-        );
-        // depth 2: second from the right.
-        assert_eq!(
-            forwarded_ip_at_depth(xff, 2),
-            Some(IpAddr::V4(Ipv4Addr::new(70, 41, 3, 18)))
-        );
-        // depth 3: the originating client (leftmost of a 3-hop chain).
-        assert_eq!(
-            forwarded_ip_at_depth(xff, 3),
-            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)))
-        );
-        // depth beyond the number of hops trusts nothing.
-        assert_eq!(forwarded_ip_at_depth(xff, 4), None);
     }
 
     /// Regression: with the client's originating IP trusted (all 3 proxies
@@ -791,24 +720,19 @@ mod tests {
         );
     }
 
-    /// With the safe default (no trusted proxy), `X-Forwarded-For` is not
-    /// trusted at all: no IP is derived from it, so a spoofed header cannot be
-    /// used to target or partition rate-limit buckets.
-    #[tokio::test]
-    async fn test_xff_ignored_when_no_trusted_proxy() {
-        let middleware = RateLimitMiddleware::new(create_test_limiter().await);
-        assert_eq!(middleware.trusted_proxy_depth, 0);
-
-        // Sanity: the selector itself refuses to trust anything at depth 0.
-        assert_eq!(forwarded_ip_at_depth("1.2.3.4, 5.6.7.8", 0), None);
+    fn ok_next() -> armature_core::middleware::Next {
+        Box::new(|_r| Box::pin(async { Ok(armature_core::HttpResponse::ok()) }))
     }
 
-    /// A default-configured middleware has no IP to key on (no peer address is
-    /// exposed and no proxy is trusted), so it rate limits nothing. That is the
-    /// documented default posture — but it must be *counted*, not silent, so an
-    /// operator can tell the control is inert.
+    fn peer(ip: &str) -> Option<std::net::SocketAddr> {
+        Some(std::net::SocketAddr::new(ip.parse().unwrap(), 40000))
+    }
+
+    /// Security regression (H11): the default middleware used to have no IP to
+    /// key on (depth 0 → no address → unkeyed → allowed), so it limited
+    /// nothing. It now keys on the socket peer.
     #[tokio::test]
-    async fn test_default_middleware_unkeyed_requests_are_allowed_and_counted() {
+    async fn test_default_middleware_limits_on_socket_peer() {
         use armature_core::Middleware;
 
         let limiter = Arc::new(
@@ -819,17 +743,149 @@ mod tests {
                 .unwrap(),
         );
         let middleware = RateLimitMiddleware::new(limiter);
+        assert_eq!(middleware.trusted_proxy_depth, 0);
+
+        // Rotating forwarding headers must not mint fresh buckets at depth 0.
+        let make_req = |xff: &str| {
+            let mut req = armature_core::HttpRequest::new("GET", "/api/test".to_string())
+                .with_peer(peer("198.51.100.7"));
+            req.headers.insert("x-forwarded-for", xff.to_string());
+            req.headers.insert("x-real-ip", xff.to_string());
+            req
+        };
+
+        let r1 = middleware
+            .handle(make_req("203.0.113.1"), ok_next())
+            .await
+            .unwrap();
+        assert_eq!(r1.status, 200);
+        let r2 = middleware
+            .handle(make_req("203.0.113.2"), ok_next())
+            .await
+            .unwrap();
+        assert_eq!(r2.status, 429, "the default middleware must actually limit");
+
+        // A different peer has its own bucket.
+        let mut other = armature_core::HttpRequest::new("GET", "/api/test".to_string())
+            .with_peer(peer("198.51.100.8"));
+        other.headers.insert("x-forwarded-for", "203.0.113.1");
+        let r3 = middleware.handle(other, ok_next()).await.unwrap();
+        assert_eq!(r3.status, 200);
+        assert_eq!(middleware.unkeyed_allow_count(), 0);
+    }
+
+    /// Security regression (H11/M40): `X-Real-IP` was trusted as a fallback
+    /// and only the first `X-Forwarded-For` line was read. With a trusted proxy
+    /// that appends its own line, the client is the rightmost hop across all
+    /// lines, and `X-Real-IP` is ignored.
+    #[tokio::test]
+    async fn test_xff_read_across_lines_and_x_real_ip_ignored() {
+        use armature_core::Middleware;
+
+        let limiter = Arc::new(
+            RateLimiter::builder()
+                .token_bucket(1, f64::EPSILON)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let middleware = RateLimitMiddleware::new(limiter).with_trusted_proxy_depth(1);
+
+        let make_req = |spoofed: &str| {
+            let mut req = armature_core::HttpRequest::new("GET", "/api/test".to_string())
+                .with_peer(peer("10.0.0.2"));
+            // Client-supplied line, then the trusted proxy's own line.
+            req.headers.append("x-forwarded-for", spoofed.to_string());
+            req.headers
+                .append("x-forwarded-for", "192.0.2.50".to_string());
+            req.headers.insert("x-real-ip", spoofed.to_string());
+            req
+        };
+
+        let r1 = middleware
+            .handle(make_req("203.0.113.1"), ok_next())
+            .await
+            .unwrap();
+        assert_eq!(r1.status, 200);
+        let r2 = middleware
+            .handle(make_req("203.0.113.9"), ok_next())
+            .await
+            .unwrap();
+        assert_eq!(
+            r2.status, 429,
+            "spoofed first line / X-Real-IP must not select the bucket"
+        );
+
+        // With only X-Real-IP (no XFF), depth 1 has no trustworthy address.
+        let mut only_real_ip = armature_core::HttpRequest::new("GET", "/api/test".to_string())
+            .with_peer(peer("10.0.0.2"));
+        only_real_ip.headers.insert("x-real-ip", "203.0.113.77");
+        let r3 = middleware.handle(only_real_ip, ok_next()).await.unwrap();
+        assert_eq!(
+            r3.status, 429,
+            "unkeyed (no XFF) is denied, X-Real-IP unused"
+        );
+    }
+
+    /// Security regression (H11): `UserId` was keyed on the client-supplied
+    /// `X-User-Id` header. Only a verified `VerifiedIdentity` keys the request now.
+    #[tokio::test]
+    async fn test_user_id_only_from_verified_identity() {
+        use armature_core::Middleware;
+
+        let limiter = Arc::new(
+            RateLimiter::builder()
+                .token_bucket(1, f64::EPSILON)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let middleware = RateLimitMiddleware::new(limiter).with_extractor(KeyExtractor::UserId);
+
+        // Header only: unkeyed → denied by default, never a fresh bucket.
+        for i in 0..3 {
+            let mut req = armature_core::HttpRequest::new("POST", "/login".to_string());
+            req.headers.insert("x-user-id", format!("forged-{i}"));
+            let res = middleware.handle(req, ok_next()).await.unwrap();
+            assert_eq!(res.status, 429, "a forged X-User-Id must not key a bucket");
+        }
+
+        let make_req = |forged: &str| {
+            let mut req = armature_core::HttpRequest::new("POST", "/login".to_string());
+            req.headers.insert("x-user-id", forged.to_string());
+            req.insert_extension(VerifiedIdentity::new("real-user"));
+            req
+        };
+        let r1 = middleware.handle(make_req("a"), ok_next()).await.unwrap();
+        assert_eq!(r1.status, 200);
+        let r2 = middleware.handle(make_req("b"), ok_next()).await.unwrap();
+        assert_eq!(
+            r2.status, 429,
+            "the verified user shares one bucket whatever the header says"
+        );
+    }
+
+    /// The unkeyed policy defaults to deny; `Allow` is an explicit opt-in that
+    /// is counted.
+    #[tokio::test]
+    async fn test_unkeyed_allow_policy_is_opt_in_and_counted() {
+        use armature_core::Middleware;
+
+        let limiter = Arc::new(
+            RateLimiter::builder()
+                .token_bucket(1, f64::EPSILON)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let middleware =
+            RateLimitMiddleware::new(limiter).with_unkeyed_policy(UnkeyedRequestPolicy::Allow);
+        assert_eq!(UnkeyedRequestPolicy::default(), UnkeyedRequestPolicy::Deny);
 
         for expected in 1..=3u64 {
             let req = armature_core::HttpRequest::new("GET", "/api/test".to_string());
-            let res = middleware
-                .handle(
-                    req,
-                    Box::new(|_r| Box::pin(async { Ok(armature_core::HttpResponse::ok()) })),
-                )
-                .await
-                .unwrap();
-            assert_eq!(res.status, 200, "unkeyed requests are allowed by default");
+            let res = middleware.handle(req, ok_next()).await.unwrap();
+            assert_eq!(res.status, 200);
             assert_eq!(middleware.unkeyed_allow_count(), expected);
         }
     }
@@ -847,8 +903,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let middleware =
-            RateLimitMiddleware::new(limiter).with_unkeyed_policy(UnkeyedRequestPolicy::Deny);
+        // Deny is the default; no opt-in needed.
+        let middleware = RateLimitMiddleware::new(limiter);
 
         let req = armature_core::HttpRequest::new("GET", "/api/test".to_string());
         let res = middleware
@@ -876,9 +932,10 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let middleware = RateLimitMiddleware::new(limiter).with_extractor(KeyExtractor::ApiKey {
-            header_name: "X-API-Key".to_string(),
-        });
+        let middleware = RateLimitMiddleware::new(limiter)
+            .with_extractor(KeyExtractor::api_key("X-API-Key", |k: &str| {
+                k == "sk_live_abc"
+            }));
 
         let make_req = || {
             let mut req = armature_core::HttpRequest::new("GET", "/api/test".to_string());
