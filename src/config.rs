@@ -86,15 +86,13 @@ pub struct RateLimitConfig {
     pub operation_timeout: Duration,
     /// Number of trusted reverse proxies in front of the application.
     ///
-    /// Controls how the client IP is derived from `X-Forwarded-For`: the
-    /// rightmost hops are appended by *your* infrastructure and are
-    /// trustworthy, so the client is selected `trusted_proxy_depth`-from-the-
-    /// right. A value of `0` (the default) means **no** proxy is trusted and
-    /// `X-Forwarded-For`/`X-Real-IP` are ignored entirely, because those
-    /// headers are attacker-controlled when the request is not known to have
-    /// passed through a trusted proxy. Set this to the exact number of proxies
-    /// between the client and the app to enable IP rate limiting on proxied
-    /// traffic.
+    /// Passed to `armature_core::HttpRequest::client_address`. A value of `0`
+    /// (the default) keys on the **socket peer** and ignores forwarding headers
+    /// entirely, because they are attacker-controlled when the request is not
+    /// known to have passed through a trusted proxy. Behind proxies, set this
+    /// to the exact number of proxies between the client and the app: the
+    /// client is then the `trusted_proxy_depth`-th `X-Forwarded-For` hop from
+    /// the right, counted across every header line. `X-Real-IP` is never read.
     pub trusted_proxy_depth: usize,
 }
 
@@ -263,8 +261,8 @@ impl RateLimiterBuilder {
 
     /// Set the number of trusted reverse proxies in front of the app.
     ///
-    /// See [`RateLimitConfig::trusted_proxy_depth`]. Defaults to `0`
-    /// (`X-Forwarded-For`/`X-Real-IP` are not trusted).
+    /// See [`RateLimitConfig::trusted_proxy_depth`]. Defaults to `0` (key on
+    /// the socket peer; forwarding headers are not trusted).
     pub fn trusted_proxy_depth(mut self, depth: usize) -> Self {
         self.trusted_proxy_depth = depth;
         self

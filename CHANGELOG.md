@@ -9,6 +9,28 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
+### Security
+
+- `RateLimitMiddleware` derives the client address from `HttpRequest::client_address(trusted_proxy_depth)`. With the default depth `0` it now keys on the **socket peer** (previously it had no address and limited nothing); with a depth it reads the forwarded chain across every `X-Forwarded-For` line instead of only the first. `X-Real-IP` is no longer consulted.
+- `KeyExtractor::UserId` / `UserIdAndPath` key only on the `armature_core::VerifiedIdentity` request extension an authentication layer attaches after verifying a credential; the client-supplied `X-User-Id` header is ignored.
+- API-key buckets are created only for keys an `ApiKeyValidator` accepts and are named `apikey:<sha256>`; rotating junk keys no longer mints unlimited buckets.
+- IPv6 clients are bucketed by /64 (IPv4-mapped addresses as IPv4); `IpAndPath` / `UserIdAndPath` normalize the path (`//`, `.`, `..`, trailing `/`, query), so path variants share one bucket.
+- Rate-limit keys are never logged verbatim (12-hex-char SHA-256 fingerprint only), and the Redis store names its keys by the key's SHA-256 digest. The Redis connection URL (which may hold a password) is no longer logged.
+
+### Changed
+
+- **Breaking:** `UnkeyedRequestPolicy` defaults to `Deny` (was `Allow`): a request no key can be derived from gets a 429. Opt back in with `.with_unkeyed_policy(UnkeyedRequestPolicy::Allow)` only where another layer protects the route.
+- **Breaking:** `KeyExtractor::ApiKey` gained a `validator: ApiKeyValidator` field; `KeyExtractor::api_key(header, validator)` and `KeyExtractorBuilder::prefer_api_key(header, validator)` take a `Fn(&str) -> bool`. Migration: pass a check against your known keys (e.g. a set lookup).
+- **Breaking:** `UserId` / `UserIdAndPath` keying requires the rate-limit middleware to run after the authentication middleware that inserts `VerifiedIdentity`; without it those requests are unkeyed (and denied by default).
+- **Breaking:** existing Redis rate-limit state is not carried over (key names are now digests); buckets start fresh after upgrading.
+
+### Added
+
+- `extractor::{key_digest, key_fingerprint, api_key_bucket, ip_bucket, normalize_path}` helpers and `ApiKeyValidator`.
+- Dependency: `sha2` 0.11.
+
 ## [0.5.0] - 2026-09-15
 
 ### Changed

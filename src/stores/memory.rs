@@ -229,7 +229,7 @@ impl RateLimitStore for MemoryStore {
         capacity: u64,
         refill_rate: f64,
     ) -> RateLimitResult<(bool, u64)> {
-        trace!(key = %key, capacity = capacity, refill_rate = refill_rate, "Token bucket check");
+        trace!(key = %crate::extractor::key_fingerprint(key), capacity = capacity, refill_rate = refill_rate, "Token bucket check");
 
         let now = Instant::now();
 
@@ -250,10 +250,10 @@ impl RateLimitStore for MemoryStore {
         if entry.tokens >= 1.0 {
             entry.tokens -= 1.0;
             let remaining = entry.tokens as u64;
-            trace!(key = %key, remaining = remaining, "Token bucket: allowed");
+            trace!(key = %crate::extractor::key_fingerprint(key), remaining = remaining, "Token bucket: allowed");
             Ok((true, remaining))
         } else {
-            trace!(key = %key, "Token bucket: denied");
+            trace!(key = %crate::extractor::key_fingerprint(key), "Token bucket: denied");
             Ok((false, 0))
         }
     }
@@ -264,7 +264,7 @@ impl RateLimitStore for MemoryStore {
         max_requests: u64,
         window: Duration,
     ) -> RateLimitResult<(bool, u64)> {
-        trace!(key = %key, max_requests = max_requests, window = ?window, "Sliding window check");
+        trace!(key = %crate::extractor::key_fingerprint(key), max_requests = max_requests, window = ?window, "Sliding window check");
 
         let now = Instant::now();
         let cutoff = now - window;
@@ -287,10 +287,10 @@ impl RateLimitStore for MemoryStore {
         if current_count < max_requests {
             entry.log.push_back(now);
             let remaining = max_requests - current_count - 1;
-            trace!(key = %key, remaining = remaining, "Sliding window: allowed");
+            trace!(key = %crate::extractor::key_fingerprint(key), remaining = remaining, "Sliding window: allowed");
             Ok((true, remaining))
         } else {
-            trace!(key = %key, "Sliding window: denied");
+            trace!(key = %crate::extractor::key_fingerprint(key), "Sliding window: denied");
             Ok((false, 0))
         }
     }
@@ -301,7 +301,7 @@ impl RateLimitStore for MemoryStore {
         max_requests: u64,
         window: Duration,
     ) -> RateLimitResult<(bool, u64)> {
-        trace!(key = %key, max_requests = max_requests, window = ?window, "Fixed window check");
+        trace!(key = %crate::extractor::key_fingerprint(key), max_requests = max_requests, window = ?window, "Fixed window check");
 
         let now = Instant::now();
 
@@ -327,16 +327,16 @@ impl RateLimitStore for MemoryStore {
         if entry.count < max_requests {
             entry.count += 1;
             let remaining = max_requests - entry.count;
-            trace!(key = %key, remaining = remaining, "Fixed window: allowed");
+            trace!(key = %crate::extractor::key_fingerprint(key), remaining = remaining, "Fixed window: allowed");
             Ok((true, remaining))
         } else {
-            trace!(key = %key, "Fixed window: denied");
+            trace!(key = %crate::extractor::key_fingerprint(key), "Fixed window: denied");
             Ok((false, 0))
         }
     }
 
     async fn reset(&self, key: &str) -> RateLimitResult<()> {
-        debug!(key = %key, "Resetting rate limit state");
+        debug!(key = %crate::extractor::key_fingerprint(key), "Resetting rate limit state");
         self.token_buckets.remove(key);
         self.sliding_logs.remove(key);
         self.fixed_windows.remove(key);

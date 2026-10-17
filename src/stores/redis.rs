@@ -4,6 +4,7 @@
 //! Requires the `redis` feature to be enabled.
 
 use crate::error::{RateLimitError, RateLimitResult};
+use crate::extractor::key_digest;
 use crate::stores::RateLimitStore;
 use async_trait::async_trait;
 use redis::AsyncCommands;
@@ -40,7 +41,8 @@ impl RedisStore {
     ///
     /// Returns an error if the connection fails.
     pub async fn new(url: &str) -> RateLimitResult<Self> {
-        debug!(url = %url, "Connecting to Redis for rate limiting");
+        // The URL is not logged: it routinely carries the Redis password.
+        debug!("Connecting to Redis for rate limiting");
 
         let client = redis::Client::open(url)?;
         let conn = ConnectionManager::new(client).await?;
@@ -95,6 +97,11 @@ impl RateLimitStore for RedisStore {
         capacity: u64,
         refill_rate: f64,
     ) -> RateLimitResult<(bool, u64)> {
+        // Store (and log) only the SHA-256 digest of the rate-limit key: the
+        // raw key may be a credential, and hex digests also carry no `SCAN`
+        // glob metacharacters into the reset sweep's pattern.
+        let digest = key_digest(key);
+        let key = digest.as_str();
         trace!(key = %key, capacity = capacity, refill_rate = refill_rate, "Redis token bucket check");
 
         let full_key = self.key(&format!("tb:{}", key));
@@ -164,6 +171,11 @@ impl RateLimitStore for RedisStore {
         max_requests: u64,
         window: Duration,
     ) -> RateLimitResult<(bool, u64)> {
+        // Store (and log) only the SHA-256 digest of the rate-limit key: the
+        // raw key may be a credential, and hex digests also carry no `SCAN`
+        // glob metacharacters into the reset sweep's pattern.
+        let digest = key_digest(key);
+        let key = digest.as_str();
         trace!(key = %key, max_requests = max_requests, window = ?window, "Redis sliding window check");
 
         let full_key = self.key(&format!("sw:{}", key));
@@ -251,6 +263,11 @@ impl RateLimitStore for RedisStore {
         max_requests: u64,
         window: Duration,
     ) -> RateLimitResult<(bool, u64)> {
+        // Store (and log) only the SHA-256 digest of the rate-limit key: the
+        // raw key may be a credential, and hex digests also carry no `SCAN`
+        // glob metacharacters into the reset sweep's pattern.
+        let digest = key_digest(key);
+        let key = digest.as_str();
         trace!(key = %key, max_requests = max_requests, window = ?window, "Redis fixed window check");
 
         // Compute the window bucket in milliseconds so sub-second windows
@@ -317,6 +334,11 @@ impl RateLimitStore for RedisStore {
     }
 
     async fn reset(&self, key: &str) -> RateLimitResult<()> {
+        // Store (and log) only the SHA-256 digest of the rate-limit key: the
+        // raw key may be a credential, and hex digests also carry no `SCAN`
+        // glob metacharacters into the reset sweep's pattern.
+        let digest = key_digest(key);
+        let key = digest.as_str();
         debug!(key = %key, "Resetting rate limit state in Redis");
 
         let mut conn = self.conn.clone();
@@ -370,6 +392,11 @@ impl RateLimitStore for RedisStore {
     }
 
     async fn remaining(&self, key: &str) -> RateLimitResult<u64> {
+        // Store (and log) only the SHA-256 digest of the rate-limit key: the
+        // raw key may be a credential, and hex digests also carry no `SCAN`
+        // glob metacharacters into the reset sweep's pattern.
+        let digest = key_digest(key);
+        let key = digest.as_str();
         let mut conn = self.conn.clone();
 
         // Token bucket: remaining == floor(tokens). Probed first so the common
