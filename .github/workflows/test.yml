@@ -16,13 +16,13 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # `armature-testkit` is `publish = false`, so this crate's dev-dependency on
       # it cannot come from the registry. It is the one sibling that still has to
       # be present on disk; everything else resolves from crates.io.
         with:
           persist-credentials: false
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: quinnjr/armature-testkit
           # Pinned: without a ref this takes whatever the default branch holds
@@ -46,13 +46,13 @@ jobs:
     name: MSRV 1.94.1
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # `armature-testkit` is `publish = false`, so this crate's dev-dependency on
       # it cannot come from the registry. It is the one sibling that still has to
       # be present on disk; everything else resolves from crates.io.
         with:
           persist-credentials: false
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: quinnjr/armature-testkit
           # Pinned: without a ref this takes whatever the default branch holds
