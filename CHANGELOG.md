@@ -9,6 +9,12 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-29
+
+### Changed
+
+- Requires `armature-core` 0.12 (was `0.11`).
+
 ## [0.6.0] - 2026-10-17
 
 ### Security
